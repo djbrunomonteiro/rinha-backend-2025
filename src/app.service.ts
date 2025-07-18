@@ -24,6 +24,7 @@ import {
   switchMap,
   take,
   tap,
+  throwError,
   timeout,
   timer,
 } from 'rxjs';
@@ -32,7 +33,7 @@ import Database from 'better-sqlite3';
 import * as fs from 'fs';
 
 interface PaymentRequest {
-  payment: paymentDTO; 
+  payment: paymentDTO;
   resolve: (value: any) => void;
   reject: (reason?: any) => void;
 }
@@ -57,14 +58,13 @@ export class AppService {
 
   constructor(private http: HttpService) {
     this.initDB();
-  
+
 
     this.listenHealth();
     this.listenEnqueuePayment();
   }
 
-  async purgePayment(){
-    this.db.exec(`DELETE FROM payments;`);
+  async purgePayment() {
     const response = await firstValueFrom(
       this.http.post(`${this.defaultUrl}/admin/purge-payments`, {}, {
         headers: {
@@ -110,7 +110,7 @@ export class AppService {
             minResponseTime: Infinity,
           }).pipe(delay(retryAfter * 1000));
         }
-  
+
         if (res.status >= 200 && res.status < 300) {
           const data = res.data;
           return of({
@@ -118,7 +118,7 @@ export class AppService {
             minResponseTime: data.minResponseTime ?? Infinity,
           });
         }
-  
+
         return of({
           healthy: false,
           minResponseTime: Infinity,
@@ -133,10 +133,10 @@ export class AppService {
       }),
     );
   }
-  
+
   listenEnqueuePayment() {
     this.paymentQueue$
-      .pipe(mergeMap((payment) => this.processPayment(payment), 5))
+      .pipe(mergeMap((payment) => this.processPayment(payment)))
       .subscribe();
   }
 
@@ -154,36 +154,36 @@ export class AppService {
     ]).pipe(
       switchMap(([defaultHealth, fallbackHealth, isDefaultBlocked]) => {
         const shouldUseDefault = defaultHealth.healthy && !isDefaultBlocked;
-  
+
         if (shouldUseDefault) {
           return this.tryProcess(paymentRequest.payment, 'default', this.defaultUrl).pipe(
-            timeout(3000),
+            timeout(5000),
             catchError(() => {
               this.triggerDefaultCooldown();
               if (fallbackHealth.healthy) {
                 return this.tryProcess(paymentRequest.payment, 'fallback', this.fallbackUrl).pipe(
-                  timeout(3000),
+                  timeout(5000),
                   catchError((err) => {
-                    return of(`falha no fallback: ${err.message || err}`);
+                    return throwError(() => new Error(`falha no fallback: ${err.message || err}`));
                   })
                 );
               }
-              return of('falha em ambos (default e fallback indisponível)');
+              return throwError(() => new Error(`falha no fallback`));
             })
           );
         }
-  
+
         if (fallbackHealth.healthy) {
           return this.tryProcess(paymentRequest.payment, 'fallback', this.fallbackUrl).pipe(
             timeout(3000),
             catchError((err) => {
-              return of(`falha no fallback direto: ${err.message || err}`);
+              return throwError(() => new Error(`falha no fallback`));
             })
           );
         }
-  
+
         // Ao invés de lançar erro direto, transforme em Observable
-        return of('nenhuma rota disponível (default e fallback indisponíveis)');
+        return throwError(() => new Error(`falha em ambos`));
       }),
       tap({
         next: (result) => paymentRequest.resolve(result),
@@ -195,12 +195,12 @@ export class AppService {
         return EMPTY; // ou `of(null)` se quiser continuar a stream
       })
     );
-  
+
     return process$;
   }
-  
 
-  private tryProcess(payment: paymentDTO, origin: string, baseUrl: string, ) {
+
+  private tryProcess(payment: paymentDTO, origin: string, baseUrl: string,) {
     const url = `${baseUrl}/payments`;
     return this.http.post(url, payment).pipe(
       timeout(5000),
@@ -233,10 +233,10 @@ export class AppService {
 
   // }
 
-  initDB(){
+  initDB() {
     const path = './data/payments.db';
     if (!fs.existsSync('./data')) fs.mkdirSync('./data');
-    
+
     this.db = new Database(path);
     this.db.pragma('journal_mode = WAL');
 
@@ -248,9 +248,48 @@ export class AppService {
         origin TEXT NOT NULL
       );
     `);
+
+    // Tabela de contadores por tipo
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS account (
+        type TEXT PRIMARY KEY,
+        total_requests INTEGER NOT NULL DEFAULT 0,
+        total_amount REAL NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+      );
+    `);
+
+    this.db.exec(`DELETE FROM payments;`);
+    this.db.exec(`DELETE FROM account;`);
+
+    // Inserção inicial de tipos de conta (default e fallback)
+    this.db.prepare(`
+      INSERT INTO account (type) VALUES (?)
+      ON CONFLICT(type) DO NOTHING
+    `).run('default');
+
+    this.db.prepare(`
+      INSERT INTO account (type) VALUES (?)
+      ON CONFLICT(type) DO NOTHING
+    `).run('fallback');
+
+    // Trigger para atualizar contadores após inserir em payments
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS update_account_after_payment
+      AFTER INSERT ON payments
+      BEGIN
+        UPDATE account
+        SET total_requests = total_requests + 1,
+            total_amount = total_amount + NEW.amount,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE type = NEW.origin;
+      END;
+    `);
+
+
   }
 
-  add(payment: paymentDTO, origin: string){
+  add(payment: paymentDTO, origin: string) {
     try {
       this.db.prepare(`
         INSERT INTO payments (correlation_id, amount, origin)
@@ -264,30 +303,43 @@ export class AppService {
   }
 
   getPaymentsSummary(from: string, to: string) {
-    const stmt = this.db.prepare(`
-      SELECT origin,
-             COUNT(*) as totalRequests,
-             SUM(amount) as totalAmount
+
+    const teste = this.db.prepare(`
+      SELECT *
         FROM payments
-       WHERE requested_at >= ? AND requested_at <= ?
-       GROUP BY origin;
+        ORDER BY requested_at DESC;
     `);
   
-    const rows = stmt.all(from, to);
-  
+    const todos = teste.all();
+    console.log(todos)
+
+
+    const stmt = this.db.prepare(`
+      SELECT type as origin,
+             total_requests as totalRequests,
+             total_amount as totalAmount
+        FROM account
+        WHERE type IN ('default', 'fallback');
+    `);
+    const rows = stmt.all();
+
     const result = {
-      default: { totalRequests: 0, totalAmount: 0 },
-      fallback: { totalRequests: 0, totalAmount: 0 },
+      default: { totalRequests: 0, totalAmount: 0, from, to },
+      fallback: { totalRequests: 0, totalAmount: 0, from, to },
     };
-  
+
+    console.log(rows)
+
     for (const row of rows) {
       const key = row.origin === 'default' ? 'default' : 'fallback';
       result[key] = {
         totalRequests: Number(row.totalRequests),
         totalAmount: Number(row.totalAmount),
+        from,
+        to,
       };
     }
-  
+
     return result;
   }
 
