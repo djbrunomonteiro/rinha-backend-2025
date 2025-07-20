@@ -5,345 +5,285 @@
 /* eslint-disable prettier/prettier */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 import { HttpService } from '@nestjs/axios';
-import { Injectable } from '@nestjs/common';
+import { HttpStatus, Injectable, Res } from '@nestjs/common';
 import {
-  BehaviorSubject,
+  bufferCount,
+  bufferTime,
   catchError,
-  combineLatest,
   delay,
-  EMPTY,
   filter,
   firstValueFrom,
+  forkJoin,
   from,
   interval,
   map,
   mergeMap,
   of,
-  race,
+  retry,
+  startWith,
   Subject,
   switchMap,
-  take,
   tap,
-  throwError,
   timeout,
-  timer,
 } from 'rxjs';
 import { paymentDTO } from './app.controller';
-import Database from 'better-sqlite3';
-import * as fs from 'fs';
+import { Response } from 'express';
 
-interface PaymentRequest {
-  payment: paymentDTO;
-  resolve: (value: any) => void;
-  reject: (reason?: any) => void;
-}
+import { Client } from 'pg';
+import { Worker } from 'worker_threads';
+import { join } from 'path';
 
 @Injectable()
 export class AppService {
-  defaultUrl = process.env.PAYMENT_PROCESSOR_URL_DEFAULT || 'http://payment-processor-default:8080';;
+
+  private client: Client;
+  private worker: Worker;
+
+
+  defaultUrl = process.env.PAYMENT_PROCESSOR_URL_DEFAULT || 'http://payment-processor-default:8080';
   fallbackUrl = process.env.PAYMENT_PROCESSOR_URL_FALLBACK || 'http://payment-processor-fallback:8080';
+  healthyApis: string[] = [];
 
-  private db: Database;
+  queue$ = new Subject<paymentDTO>();
 
-  private paymentQueue$ = new Subject<PaymentRequest>();
-  private defaultHealth$ = new BehaviorSubject<any>({
-    healthy: true,
-    minResponseTime: 1000,
-  });
-  private fallbackHealth$ = new BehaviorSubject<any>({
-    healthy: true,
-    minResponseTime: 1000,
-  });
-  private defaultBlocked$ = new BehaviorSubject<boolean>(false);
+
 
   constructor(private http: HttpService) {
-    this.initDB();
+    this.listenQueue()
+  }
 
+  async enqueue(payment: paymentDTO, @Res() res: Response){
+    this.queue$.next(payment);
+    const response$ = of(res.status(HttpStatus.ACCEPTED).json({ message: 'Pagamento enfileirado' })).pipe(delay(3500))
+    return await firstValueFrom(response$);
+
+  }
+
+  listenQueue(){
+    this.queue$.pipe(
+      bufferTime(5000, undefined, 30),
+      filter(payments => payments.length > 0),
+      mergeMap(payments => this.dispatchPayments(payments)
+      )
+    ).subscribe()
+  }
+
+  dispatchPayments(batch: paymentDTO[]) {
+
+    if(!this.healthyApis.length){
+      for (let index = 0; index < batch.length; index++) {
+        const payment = batch[index];
+        this.insertPayment(payment, 'pending')
+      }
+      return of()
+    }
+    
+    
+
+    // Divide o lote igualmente entre as APIs
+    const result$: any[] = [];
+
+    const chunkSize = Math.ceil(batch.length / this.healthyApis.length);
+
+    for (let i = 0; i < this.healthyApis.length; i++) {
+      const subBatch = batch.slice(i * chunkSize, (i + 1) * chunkSize);
+      const url = this.healthyApis[i];
+
+      const apiRequests$ = from(subBatch).pipe(
+        mergeMap(payment => this.sendPayment(payment, url))
+      );
+
+      result$.push(apiRequests$);
+    }
+
+    // Processa tudo em paralelo
+    return from(result$).pipe(mergeMap(stream => stream));
+  }
+
+
+
+
+  async onModuleInit() {
+    this.client = new Client({
+      host: 'db',
+      port: 5432,
+      user: 'postgres',
+      password: 'postgres',
+      database: 'payments',
+    });
+
+    await this.client.connect();
 
     this.listenHealth();
-    this.listenEnqueuePayment();
+
+    const workerPath = join(__dirname, 'workers', 'process-payments.js');
+    this.worker = new Worker(workerPath);
   }
 
-  async purgePayment() {
-    const response = await firstValueFrom(
-      this.http.post(`${this.defaultUrl}/admin/purge-payments`, {}, {
-        headers: {
-          'X-Rinha-Token': '123',
-        },
-      }),
-    );
-    return response.data;
-  }
-
-  listenHealth() {
-    const endpoints = [
-      { path: this.defaultUrl, subject: this.defaultHealth$ },
-      { path: this.fallbackUrl, subject: this.fallbackHealth$ },
-    ];
-
-    interval(5100)
-      .pipe(
-        mergeMap(() => from(endpoints)),
-        mergeMap(({ path, subject }) => {
-          const url = `${path}/payments/service-health`;
-          return this.rxCheckHealth(url).pipe(
-            mergeMap((status) => {
-              subject.next(status);
-              return of(null);
-            }),
-            catchError(err => of(err))
-          );
-        }),
-      )
-      .subscribe();
-  }
-
-  private rxCheckHealth(url: string) {
-    return this.http.get(url, {
-      validateStatus: () => true
-    }).pipe(
-      mergeMap((res) => {
-        if (res.status === 429) {
-          const retryAfter = parseInt(res.headers['retry-after'] || '5', 10);
-          return of({
-            healthy: false,
-            minResponseTime: Infinity,
-          }).pipe(delay(retryAfter * 1000));
-        }
-
-        if (res.status >= 200 && res.status < 300) {
-          const data = res.data;
-          return of({
-            healthy: !data.failing,
-            minResponseTime: data.minResponseTime ?? Infinity,
-          });
-        }
-
-        return of({
-          healthy: false,
-          minResponseTime: Infinity,
-        });
-      }),
-      catchError((err) => {
-        console.error(`[HEALTH] ${url} erro de conexão:`, err.message);
-        return of({
-          healthy: false,
-          minResponseTime: Infinity,
-        });
-      }),
-    );
-  }
-
-  listenEnqueuePayment() {
-    this.paymentQueue$
-      .pipe(mergeMap((payment) => this.processPayment(payment)))
-      .subscribe();
-  }
-
-  enqueuePayment(payment: any): Promise<any> {
-    return new Promise((resolve, reject) => {
-      this.paymentQueue$.next({ payment, resolve, reject });
-    });
-  }
-
-  private processPayment(paymentRequest: PaymentRequest) {
-    const process$ = combineLatest([
-      this.defaultHealth$.pipe(take(1)),
-      this.fallbackHealth$.pipe(take(1)),
-      this.defaultBlocked$.pipe(take(1)),
-    ]).pipe(
-      switchMap(([defaultHealth, fallbackHealth, isDefaultBlocked]) => {
-        const shouldUseDefault = defaultHealth.healthy && !isDefaultBlocked;
-
-        if (shouldUseDefault) {
-          return this.tryProcess(paymentRequest.payment, 'default', this.defaultUrl).pipe(
-            timeout(5000),
-            catchError(() => {
-              this.triggerDefaultCooldown();
-              if (fallbackHealth.healthy) {
-                return this.tryProcess(paymentRequest.payment, 'fallback', this.fallbackUrl).pipe(
-                  timeout(5000),
-                  catchError((err) => {
-                    return throwError(() => new Error(`falha no fallback: ${err.message || err}`));
-                  })
-                );
-              }
-              return throwError(() => new Error(`falha no fallback`));
-            })
-          );
-        }
-
-        if (fallbackHealth.healthy) {
-          return this.tryProcess(paymentRequest.payment, 'fallback', this.fallbackUrl).pipe(
-            timeout(3000),
-            catchError((err) => {
-              return throwError(() => new Error(`falha no fallback`));
-            })
-          );
-        }
-
-        // Ao invés de lançar erro direto, transforme em Observable
-        return throwError(() => new Error(`falha em ambos`));
-      }),
-      tap({
-        next: (result) => paymentRequest.resolve(result),
-        error: (err) => paymentRequest.reject(err),
-      }),
-      // Segurança extra: qualquer erro escapa aqui
-      catchError((err) => {
-        paymentRequest.reject(err);
-        return EMPTY; // ou `of(null)` se quiser continuar a stream
-      })
-    );
-
-    return process$;
-  }
-
-
-  private tryProcess(payment: paymentDTO, origin: string, baseUrl: string,) {
-    const url = `${baseUrl}/payments`;
-    return this.http.post(url, payment).pipe(
-      timeout(5000),
-      map(({ data }) => {
-        this.add(payment, origin)
-        return data
-      }),
-      catchError((err) => {
-        return of(err?.message)
-      }),
-    );
-  }
-
-  private triggerDefaultCooldown() {
-    if (this.defaultBlocked$.getValue()) return;
-
-    this.defaultBlocked$.next(true);
-    race(
-      timer(5000),
-      this.defaultHealth$.pipe(
-        filter(({ healthy }) => healthy),
-        take(1),
-      ),
-    ).subscribe(() => {
-      this.defaultBlocked$.next(false);
-    });
-  }
-
-  // private paymentSummary(from: string, to: string){
-
-  // }
-
-  initDB() {
-    const path = './data/payments.db';
-    if (!fs.existsSync('./data')) fs.mkdirSync('./data');
-
-    this.db = new Database(path);
-    this.db.pragma('journal_mode = WAL');
-
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS payments (
-        correlation_id TEXT PRIMARY KEY,
-        amount REAL NOT NULL,
-        requested_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        origin TEXT NOT NULL
-      );
-    `);
-
-    // Tabela de contadores por tipo
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS account (
-        type TEXT PRIMARY KEY,
-        total_requests INTEGER NOT NULL DEFAULT 0,
-        total_amount REAL NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-      );
-    `);
-
-    this.db.exec(`DELETE FROM payments;`);
-    this.db.exec(`DELETE FROM account;`);
-
-    // Inserção inicial de tipos de conta (default e fallback)
-    this.db.prepare(`
-      INSERT INTO account (type) VALUES (?)
-      ON CONFLICT(type) DO NOTHING
-    `).run('default');
-
-    this.db.prepare(`
-      INSERT INTO account (type) VALUES (?)
-      ON CONFLICT(type) DO NOTHING
-    `).run('fallback');
-
-    // Trigger para atualizar contadores após inserir em payments
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS update_account_after_payment
-      AFTER INSERT ON payments
-      BEGIN
-        UPDATE account
-        SET total_requests = total_requests + 1,
-            total_amount = total_amount + NEW.amount,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE type = NEW.origin;
-      END;
-    `);
-
-
-  }
-
-  add(payment: paymentDTO, origin: string) {
-    try {
-      this.db.prepare(`
-        INSERT INTO payments (correlation_id, amount, origin)
-        VALUES (?, ?, ?)
-      `).run(payment.correlationId, payment.amount, origin);
-      return true;
-    } catch (e) {
-      console.log(e)
-      return false;
+  async onModuleDestroy() {
+    await this.client.end();
+    if (this.worker) {
+      this.worker.terminate();
     }
   }
 
-  getPaymentsSummary(from: string, to: string) {
+  async listenHealth() {
+    interval(5000).pipe(
+      startWith(0),
+      mergeMap(() =>
+        from(
+          this.client.query(`
+            SELECT id, url, is_healthy, min_response_time
+            FROM health_checks
+            WHERE url LIKE '%default%' OR url LIKE '%fallback%'
+          `)
+        ).pipe(
+          catchError((err) => {
+            return of({ rows: [] }); // retorna vazio pra não quebrar
+          })
+        )
+      )
+    ).subscribe((res) => {
+      const apis = res.rows;
 
-    const teste = this.db.prepare(`
-      SELECT *
-        FROM payments
-        ORDER BY requested_at DESC;
+      if (apis.length === 0) {
+        this.healthyApis = [];
+        return;
+      }
+
+      const healthyApis = apis.filter(api => api.is_healthy);
+
+      let sortedApis: typeof healthyApis;
+
+      const maxResponseTime = Math.max(...healthyApis.map(api => api.min_response_time));
+      const minResponseTime = Math.min(...healthyApis.map(api => api.min_response_time));
+      const diff = maxResponseTime - minResponseTime;
+
+      if (diff > 500) {
+        // Ordena pelo tempo de resposta se diferença for significativa
+        sortedApis = [...healthyApis].sort((a, b) => a.min_response_time - b.min_response_time);
+      } else {
+        // Mantém ordem original
+        sortedApis = healthyApis;
+      }
+
+      this.healthyApis = sortedApis;
+      console.log(this.healthyApis)
+      
+    });
+  }
+
+
+
+
+
+  // async processPayment(payment: paymentDTO, @Res() res: Response) {
+  //   try {
+  //     await this.sendPayment(payment); // função que tenta enviar e salvar conforme falhas
+  //     return res.status(HttpStatus.ACCEPTED).json({ message: 'Pagamento enfileirado' });
+  //   } catch (error) {
+  //     // Mesmo em caso de erro inesperado, retornamos 202 para não bloquear cliente
+  //     return res.status(HttpStatus.ACCEPTED).json({ message: 'Pagamento enfileirado' });
+  //   }
+  // }
+
+  sendPayment(payment: any, url: string) {
+    if (!url) {
+      // Sem APIs disponíveis, salva direto como pendente
+      return from(this.insertPayment(payment, 'pending'));
+    }
+
+    return this.http.post(`${url}/payments`, { ...payment, amount: Number(payment.amount) }).pipe(
+      retry(3),
+      timeout(1500),
+      switchMap((res) =>
+        // Se sucesso, insere como aprovado e retorna o resultado
+        from(this.insertPayment(payment, 'approved'))
+      ),
+      catchError(() => {
+        return from(this.insertPayment(payment, 'pending'));
+      })
+    );
+  }
+  
+  
+
+  async insertPayment(payment: paymentDTO, status = 'pending') {
+    const query = `
+      INSERT INTO payments_queue (correlation_id, amount, requested_at, status)
+      VALUES ($1, $2, $3, $4)
+      RETURNING *;
+    `;
+
+    const values = [payment.correlationId, payment.amount, payment?.requestedAt, status];
+    const result = await this.client.query(query, values);
+    return result.rows[0];
+  }
+  
+
+
+  async purgePayment() {
+    // Limpa a tabela primeiro
+    await this.client.query(`DELETE FROM payments_queue`);
+    await this.client.query(`
+      UPDATE payments_summary
+      SET total_requests = 0,
+          total_amount = 0
     `);
   
-    const todos = teste.all();
-    console.log(todos)
+    // Observable que faz chamadas POST para ambos os endpoints em paralelo
+    const purgeRequests$ = forkJoin([
+      this.http.post(`${this.defaultUrl}/admin/purge-payments`, {}, {
+        headers: { 'X-Rinha-Token': '123' },
+      }),
+      this.http.post(`${this.fallbackUrl}/admin/purge-payments`, {}, {
+        headers: { 'X-Rinha-Token': '123' },
+      })
+    ]).pipe(
+      catchError(err => {
+        console.error('Erro ao purgar pagamentos:', err);
+        // Aqui você pode decidir o que retornar em caso de erro
+        throw err;
+      }),
+      map(responses => {
+        // Retorna os dados da resposta do default e fallback juntos
+        return {
+          defaultResponse: responses[0].data,
+          fallbackResponse: responses[1].data,
+        };
+      }),
+    );
+  
+    // Espera todas as requisições terminarem e retorna o resultado
+    const response = await firstValueFrom(purgeRequests$);
+    return response;
+  }
 
 
-    const stmt = this.db.prepare(`
-      SELECT type as origin,
-             total_requests as totalRequests,
-             total_amount as totalAmount
-        FROM account
-        WHERE type IN ('default', 'fallback');
+  async getPaymentsSummary() {
+    const result = await this.client.query(`
+      SELECT url_type, total_requests, total_amount
+      FROM payments_summary
+      WHERE url_type IN ('default', 'fallback')
     `);
-    const rows = stmt.all();
-
-    const result = {
-      default: { totalRequests: 0, totalAmount: 0, from, to },
-      fallback: { totalRequests: 0, totalAmount: 0, from, to },
+  
+    const rows = result.rows as { url_type: string; total_requests: number; total_amount: string }[];
+  
+    // Transforma para o formato esperado, cuidando de conversão numérica
+    const summary = {
+      default: { totalRequests: 0, totalAmount: 0 },
+      fallback: { totalRequests: 0, totalAmount: 0 },
     };
-
-    console.log(rows)
-
+  
     for (const row of rows) {
-      const key = row.origin === 'default' ? 'default' : 'fallback';
-      result[key] = {
-        totalRequests: Number(row.totalRequests),
-        totalAmount: Number(row.totalAmount),
-        from,
-        to,
+      summary[row.url_type] = {
+        totalRequests: Number(row.total_requests),
+        totalAmount: Number(row.total_amount),
       };
     }
 
-    return result;
+    return summary;
   }
-
-  onModuleDestroy() {
-    this.db.close();
-  }
+  
+  
 }

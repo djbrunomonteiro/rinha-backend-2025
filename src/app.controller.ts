@@ -9,13 +9,15 @@ import {
   HttpCode,
   Post,
   Query,
+  Res,
 } from '@nestjs/common';
 import { AppService } from './app.service';
+import { Response } from 'express';
 
 export interface paymentDTO {
   correlationId: string;
   amount: number;
-  requestedAt?: string;
+  requestedAt?: any;
 }
 
 @Controller()
@@ -23,8 +25,10 @@ export class AppController {
   constructor(private readonly appService: AppService) {}
 
   @Post('payments')
-  async createPayment(@Body() paymentData: paymentDTO) {
-    return this.appService.enqueuePayment(paymentData);
+  @HttpCode(202)
+  async createPayment(@Body() paymentData: paymentDTO, @Res() res: Response) {
+    const requestedAt = new Date()
+    return this.appService.enqueue({...paymentData, requestedAt}, res);
   }
 
   @Post('purge-payments')
@@ -35,11 +39,6 @@ export class AppController {
 
   @Get('payments-summary')
   getSummary(@Query('from') from: string, @Query('to') to: string) {
-    if (!from || !to) {
-      throw new BadRequestException(
-        'Query params "from" and "to" are required',
-      );
-    }
-    return this.appService.getPaymentsSummary(from, to);
+    return this.appService.getPaymentsSummary();
   }
 }
