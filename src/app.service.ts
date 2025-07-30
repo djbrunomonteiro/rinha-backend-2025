@@ -1,15 +1,9 @@
-/* eslint-disable @typescript-eslint/no-unsafe-argument */
-/* eslint-disable @typescript-eslint/no-unsafe-call */
-/* eslint-disable @typescript-eslint/no-unsafe-return */
-/* eslint-disable @typescript-eslint/no-unsafe-member-access */
-/* eslint-disable prettier/prettier */
-/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 import { HttpService } from '@nestjs/axios';
 import { HttpStatus, Injectable, Res } from '@nestjs/common';
 import {
-  bufferCount,
-  bufferTime,
+  BehaviorSubject,
   catchError,
+  concatMap,
   delay,
   filter,
   firstValueFrom,
@@ -19,219 +13,166 @@ import {
   map,
   mergeMap,
   of,
-  retry,
-  startWith,
   Subject,
-  switchMap,
   tap,
-  timeout,
+  withLatestFrom,
 } from 'rxjs';
 import { paymentDTO } from './app.controller';
 import { Response } from 'express';
-
-import { Client } from 'pg';
-import { Worker } from 'worker_threads';
-import { join } from 'path';
+import Decimal from 'decimal.js';
+import Redis from 'ioredis';
 
 @Injectable()
 export class AppService {
 
-  private client: Client;
-  private worker: Worker;
+  private redis: Redis;
+  private redisSub: Redis;
 
-
-  defaultUrl = process.env.PAYMENT_PROCESSOR_URL_DEFAULT || 'http://payment-processor-default:8080';
-  fallbackUrl = process.env.PAYMENT_PROCESSOR_URL_FALLBACK || 'http://payment-processor-fallback:8080';
-  healthyApis: string[] = [];
-
-  queue$ = new Subject<paymentDTO>();
-
-
-
-  constructor(private http: HttpService) {
-    this.listenQueue()
-  }
-
-  async enqueue(payment: paymentDTO, @Res() res: Response){
-    this.queue$.next(payment);
-    const response$ = of(res.status(HttpStatus.ACCEPTED).json({ message: 'Pagamento enfileirado' })).pipe(delay(3500))
-    return await firstValueFrom(response$);
-
-  }
-
-  listenQueue(){
-    this.queue$.pipe(
-      bufferTime(5000, undefined, 30),
-      filter(payments => payments.length > 0),
-      mergeMap(payments => this.dispatchPayments(payments)
-      )
-    ).subscribe()
-  }
-
-  dispatchPayments(batch: paymentDTO[]) {
-
-    if(!this.healthyApis.length){
-      for (let index = 0; index < batch.length; index++) {
-        const payment = batch[index];
-        this.insertPayment(payment, 'pending')
-      }
-      return of()
+  private defaultUrl = process.env.PAYMENT_PROCESSOR_URL_DEFAULT || 'http://payment-processor-default:8080';
+  private fallbackUrl = process.env.PAYMENT_PROCESSOR_URL_FALLBACK || 'http://payment-processor-fallback:8080';
+  private healthyApis: any[] = [
+    {
+      url: this.defaultUrl,
+      is_healthy: true,
+      min_response_time: 0,
+      checked_at: ''
+    },
+    {
+      url: this.fallbackUrl,
+      is_healthy: true,
+      min_response_time: 100,
+      checked_at: ''
     }
-    
-    
+  ];
 
-    // Divide o lote igualmente entre as APIs
-    const result$: any[] = [];
+  private queue$ = new Subject<paymentDTO>();
+  private pauser$ = new BehaviorSubject<boolean>(true);
 
-    const chunkSize = Math.ceil(batch.length / this.healthyApis.length);
-
-    for (let i = 0; i < this.healthyApis.length; i++) {
-      const subBatch = batch.slice(i * chunkSize, (i + 1) * chunkSize);
-      const url = this.healthyApis[i];
-
-      const apiRequests$ = from(subBatch).pipe(
-        mergeMap(payment => this.sendPayment(payment, url))
-      );
-
-      result$.push(apiRequests$);
-    }
-
-    // Processa tudo em paralelo
-    return from(result$).pipe(mergeMap(stream => stream));
-  }
-
-
-
+  constructor(private http: HttpService) {}
 
   async onModuleInit() {
-    this.client = new Client({
-      host: 'db',
-      port: 5432,
-      user: 'postgres',
-      password: 'postgres',
-      database: 'payments',
-    });
+    this.redis = new Redis({ host: 'redis', port: 6379 });
+    this.redisSub = new Redis({ host: 'redis', port: 6379 });
+    await this.redis.del('summary');
 
-    await this.client.connect();
-
+    this.listenQueue()
     this.listenHealth();
-
-    const workerPath = join(__dirname, 'workers', 'process-payments.js');
-    this.worker = new Worker(workerPath);
   }
 
-  async onModuleDestroy() {
-    await this.client.end();
-    if (this.worker) {
-      this.worker.terminate();
-    }
+  listenPause() {
+    this.redisSub.subscribe('payments:queue:pause');
+    this.redisSub.on('message', (channel, message) => {
+      if (channel === 'payments:queue:pause') {
+        if (message === 'pause') {
+          this.pauser$.next(false);
+        } else if (message === 'resume') {
+          this.pauser$.next(true);
+        }
+      }
+    });
+  }
+
+  listenQueue() {
+    this.queue$.pipe(
+      withLatestFrom(this.pauser$),
+      filter(([_, isRunning]) => isRunning), 
+      map(([payment]) => payment),
+      concatMap((payment) => from(this.sendPayment(payment)))
+    ).subscribe();
   }
 
   async listenHealth() {
     interval(5000).pipe(
-      startWith(0),
-      mergeMap(() =>
-        from(
-          this.client.query(`
-            SELECT id, url, is_healthy, min_response_time
-            FROM health_checks
-            WHERE url LIKE '%default%' OR url LIKE '%fallback%'
-          `)
-        ).pipe(
-          catchError((err) => {
-            return of({ rows: [] }); // retorna vazio pra não quebrar
+      mergeMap(async () => {
+        const keys = await this.redis.keys('health:*');
+        const results = await Promise.all(
+          keys.map(async (key) => {
+            const data = await this.redis.hgetall(key);
+
+            return {
+              url: data.url,
+              is_healthy: data.is_healthy === '1',
+              min_response_time: Number(data.min_response_time),
+              checked_at: data.checked_at,
+            };
           })
-        )
-      )
+        );
+
+        return results;
+      })
     ).subscribe((res) => {
-      const apis = res.rows;
-
-      if (apis.length === 0) {
-        this.healthyApis = [];
-        return;
-      }
-
-      const healthyApis = apis.filter(api => api.is_healthy);
-
-      let sortedApis: typeof healthyApis;
-
-      const maxResponseTime = Math.max(...healthyApis.map(api => api.min_response_time));
-      const minResponseTime = Math.min(...healthyApis.map(api => api.min_response_time));
-      const diff = maxResponseTime - minResponseTime;
-
-      if (diff > 500) {
-        // Ordena pelo tempo de resposta se diferença for significativa
-        sortedApis = [...healthyApis].sort((a, b) => a.min_response_time - b.min_response_time);
-      } else {
-        // Mantém ordem original
-        sortedApis = healthyApis;
-      }
-
-      this.healthyApis = sortedApis;
-      console.log(this.healthyApis)
-      
+      this.healthyApis = res.sort((a, b) => {
+        const aIsPreferred = a.url.includes('default') && a.min_response_time <= 500;
+        const bIsPreferred = b.url.includes('default') && b.min_response_time <= 500;
+        if (aIsPreferred && !bIsPreferred) return -1;
+        if (!aIsPreferred && bIsPreferred) return 1;
+        return a.min_response_time - b.min_response_time;
+      });
     });
   }
 
 
+  async enqueue(payment: paymentDTO, @Res() res: Response) {
+    this.queue$.next({ ...payment});
+    const response$ = of(res.status(HttpStatus.ACCEPTED).json({ message: 'Pagamento enfileirado' }))
+    return await firstValueFrom(response$);
+
+  }
+
+  async sendPayment(payment: any) {
+    const now = new Date();
+    const requestedAt = new Date(now.getTime() - 3000);
+    const body = { ...payment, requestedAt };
+
+    let fast = this.defaultUrl;
+    let slow = this.fallbackUrl;
+    let sort: any[] = []
 
 
+    const isHealthy = this.healthyApis.filter(({ is_healthy }) => is_healthy);
 
-  // async processPayment(payment: paymentDTO, @Res() res: Response) {
-  //   try {
-  //     await this.sendPayment(payment); // função que tenta enviar e salvar conforme falhas
-  //     return res.status(HttpStatus.ACCEPTED).json({ message: 'Pagamento enfileirado' });
-  //   } catch (error) {
-  //     // Mesmo em caso de erro inesperado, retornamos 202 para não bloquear cliente
-  //     return res.status(HttpStatus.ACCEPTED).json({ message: 'Pagamento enfileirado' });
-  //   }
-  // }
+    if (!isHealthy.length) {
+      sort = this.healthyApis.sort(
+        (a, b) => a?.min_response_time - b?.min_response_time
+      );
 
-  sendPayment(payment: any, url: string) {
-    if (!url) {
-      // Sem APIs disponíveis, salva direto como pendente
-      return from(this.insertPayment(payment, 'pending'));
+      const waitTime = 500
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+
     }
 
-    return this.http.post(`${url}/payments`, { ...payment, amount: Number(payment.amount) }).pipe(
-      retry(3),
-      timeout(1500),
-      switchMap((res) =>
-        // Se sucesso, insere como aprovado e retorna o resultado
-        from(this.insertPayment(payment, 'approved'))
-      ),
-      catchError(() => {
-        return from(this.insertPayment(payment, 'pending'));
-      })
+    fast = sort[0]?.url ?? this.defaultUrl
+    slow = sort[1]?.url ?? this.fallbackUrl
+
+
+    const postPayment = (url: string) => this.http.post(`${url}/payments`, body)
+
+    const response$ = postPayment(fast).pipe(
+      tap((response) => {
+        if (response.data?.message.includes('successfully')) {
+          this.addToSummary(fast, body)
+        }
+      }),
+      catchError(() =>
+        postPayment(slow).pipe(
+          tap((response) => {
+            if (response.data?.message.includes('successfully')) {
+              this.addToSummary(slow, body)
+            }
+          }),
+          catchError(() => {
+            this.queue$.next(body);
+            return of(null);
+          })
+        )
+      )
     );
+
+    return await firstValueFrom(response$);
   }
-  
-  
-
-  async insertPayment(payment: paymentDTO, status = 'pending') {
-    const query = `
-      INSERT INTO payments_queue (correlation_id, amount, requested_at, status)
-      VALUES ($1, $2, $3, $4)
-      RETURNING *;
-    `;
-
-    const values = [payment.correlationId, payment.amount, payment?.requestedAt, status];
-    const result = await this.client.query(query, values);
-    return result.rows[0];
-  }
-  
-
 
   async purgePayment() {
-    // Limpa a tabela primeiro
-    await this.client.query(`DELETE FROM payments_queue`);
-    await this.client.query(`
-      UPDATE payments_summary
-      SET total_requests = 0,
-          total_amount = 0
-    `);
-  
-    // Observable que faz chamadas POST para ambos os endpoints em paralelo
+    await this.redis.del('payments', 'payments:ids');
     const purgeRequests$ = forkJoin([
       this.http.post(`${this.defaultUrl}/admin/purge-payments`, {}, {
         headers: { 'X-Rinha-Token': '123' },
@@ -242,48 +183,100 @@ export class AppService {
     ]).pipe(
       catchError(err => {
         console.error('Erro ao purgar pagamentos:', err);
-        // Aqui você pode decidir o que retornar em caso de erro
         throw err;
       }),
       map(responses => {
-        // Retorna os dados da resposta do default e fallback juntos
         return {
           defaultResponse: responses[0].data,
           fallbackResponse: responses[1].data,
         };
       }),
     );
-  
-    // Espera todas as requisições terminarem e retorna o resultado
-    const response = await firstValueFrom(purgeRequests$);
-    return response;
+
+    return await firstValueFrom(purgeRequests$);
   }
 
 
-  async getPaymentsSummary() {
-    const result = await this.client.query(`
-      SELECT url_type, total_requests, total_amount
-      FROM payments_summary
-      WHERE url_type IN ('default', 'fallback')
-    `);
+  async addToSummary(url: string, payment: any) {
+    const origin = url.includes('default') ? 'default' : 'fallback';
+    const amount = Number(payment.amount || 0);
+    const correlationId = payment.correlationId;
   
-    const rows = result.rows as { url_type: string; total_requests: number; total_amount: string }[];
+    const exists = await this.redis.sismember('payments:ids', correlationId);
+    if (exists) {
+      return;
+    }
   
-    // Transforma para o formato esperado, cuidando de conversão numérica
+    await this.redis.multi()
+      .sadd('payments:ids', correlationId)
+      .rpush(
+        'payments',
+        JSON.stringify({
+          ...payment,
+          origin,
+          amount,
+        }),
+      )
+      .exec();
+  }
+  
+  async getPaymentsSummary(from, to) {
+    await this.redis.publish('payments:queue:pause', 'pause');
+    const raw = await this.redis.lrange('payments', 0, -1);
+  
     const summary = {
-      default: { totalRequests: 0, totalAmount: 0 },
-      fallback: { totalRequests: 0, totalAmount: 0 },
+      default: {
+        totalRequests: 0,
+        totalAmount: new Decimal(0),
+        totalFee: new Decimal(0),
+      },
+      fallback: {
+        totalRequests: 0,
+        totalAmount: new Decimal(0),
+        totalFee: new Decimal(0),
+      }
     };
   
-    for (const row of rows) {
-      summary[row.url_type] = {
-        totalRequests: Number(row.total_requests),
-        totalAmount: Number(row.total_amount),
-      };
+    const now = Date.now();
+    const fromDate = new Date(from).getTime();
+    const toDate = Math.min(new Date(to).getTime(), now);
+  
+    for (const item of raw) {
+      const payment = JSON.parse(item);
+      let { origin, amount, fee, requestedAt } = payment;
+  
+      const requestedAtTime = new Date(requestedAt).getTime();
+      if (requestedAtTime < fromDate || requestedAtTime > toDate) {
+        continue;
+      }
+  
+      if (!summary[origin]) continue;
+  
+      summary[origin].totalRequests++;
+      summary[origin].totalAmount = summary[origin].totalAmount.plus(new Decimal(amount));
+      summary[origin].totalFee = summary[origin].totalFee.plus(new Decimal(fee));
     }
+  
 
-    return summary;
+    const results =  {
+      default: {
+        totalRequests: summary.default.totalRequests,
+        totalAmount: Number(summary.default.totalAmount.toFixed(3)),
+        totalFee: Number(summary.default.totalFee.toFixed(3)),
+      },
+      fallback: {
+        totalRequests: summary.fallback.totalRequests,
+        totalAmount: Number(summary.fallback.totalAmount.toFixed(3)),
+        totalFee: Number(summary.fallback.totalFee.toFixed(3)),
+      },
+    };
+
+    await this.redis.publish('payments:queue:pause', 'resume');
+    return results
   }
-  
-  
+
+
+  async onModuleDestroy() {
+    await this.redis.del('payments', 'payments:ids');
+  }
 }

@@ -1,8 +1,4 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment */
-/* eslint-disable @typescript-eslint/no-unsafe-member-access */
-/* eslint-disable @typescript-eslint/no-unsafe-return */
 import {
-  BadRequestException,
   Body,
   Controller,
   Get,
@@ -12,12 +8,13 @@ import {
   Res,
 } from '@nestjs/common';
 import { AppService } from './app.service';
-import { Response } from 'express';
+
 
 export interface paymentDTO {
   correlationId: string;
   amount: number;
   requestedAt?: any;
+  retry?: number
 }
 
 @Controller()
@@ -26,9 +23,9 @@ export class AppController {
 
   @Post('payments')
   @HttpCode(202)
-  async createPayment(@Body() paymentData: paymentDTO, @Res() res: Response) {
-    const requestedAt = new Date()
-    return this.appService.enqueue({...paymentData, requestedAt}, res);
+  async createPayment(@Body() paymentData: any, @Res() res ) {
+    return await this.appService.enqueue(paymentData, res);
+
   }
 
   @Post('purge-payments')
@@ -39,6 +36,6 @@ export class AppController {
 
   @Get('payments-summary')
   getSummary(@Query('from') from: string, @Query('to') to: string) {
-    return this.appService.getPaymentsSummary();
+    return this.appService.getPaymentsSummary(from, to);
   }
 }
