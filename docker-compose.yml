@@ -15,7 +15,7 @@ services:
           memory: "20MB"
 
   health:
-    build: .
+    build: djbrunomontero/rinha-backend-2025:latest
     command: ["node", "./dist/workers/health.js"]
     depends_on:
       redis:
@@ -33,7 +33,7 @@ services:
           memory: "15MB"
 
   app1:
-    build: .
+    build: djbrunomontero/rinha-backend-2025:latest
     hostname: app1
     depends_on:
       health:
@@ -53,7 +53,7 @@ services:
           memory: "150MB"
 
   app2:
-    build: .
+    build: djbrunomontero/rinha-backend-2025:latest
     hostname: app2
     depends_on:
       health:
