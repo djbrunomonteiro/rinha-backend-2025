@@ -228,12 +228,10 @@ export class AppService {
       default: {
         totalRequests: 0,
         totalAmount: new Decimal(0),
-        totalFee: new Decimal(0),
       },
       fallback: {
         totalRequests: 0,
         totalAmount: new Decimal(0),
-        totalFee: new Decimal(0),
       }
     };
   
@@ -243,7 +241,7 @@ export class AppService {
   
     for (const item of raw) {
       const payment = JSON.parse(item);
-      let { origin, amount, fee, requestedAt } = payment;
+      let { origin, amount, requestedAt } = payment;
   
       const requestedAtTime = new Date(requestedAt).getTime();
       if (requestedAtTime < fromDate || requestedAtTime > toDate) {
@@ -254,7 +252,6 @@ export class AppService {
   
       summary[origin].totalRequests++;
       summary[origin].totalAmount = summary[origin].totalAmount.plus(new Decimal(amount));
-      summary[origin].totalFee = summary[origin].totalFee.plus(new Decimal(fee));
     }
   
 
@@ -262,12 +259,10 @@ export class AppService {
       default: {
         totalRequests: summary.default.totalRequests,
         totalAmount: Number(summary.default.totalAmount.toFixed(3)),
-        totalFee: Number(summary.default.totalFee.toFixed(3)),
       },
       fallback: {
         totalRequests: summary.fallback.totalRequests,
         totalAmount: Number(summary.fallback.totalAmount.toFixed(3)),
-        totalFee: Number(summary.fallback.totalFee.toFixed(3)),
       },
     };
 
